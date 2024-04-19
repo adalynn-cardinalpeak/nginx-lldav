@@ -4,6 +4,31 @@
  * Copyright (C) Nginx, Inc.
  */
 
+// In the repo folder
+// ./auto/configure --with-http_dav_module --with-debug --prefix=~/Documents/nginx/prefix
+// make install
+// Edit prefix/conf/nginx.conf
+// - Change the `listen` value to `8000`
+// - Below the `listen 8000;` line, add `client_max_body_size 24M;`
+// - Below `location / { ... }` add
+/*
+location /dav/ {
+    root dav;
+    client_body_temp_path davtmp;
+    dav_methods PUT DELETE MKCOL COPY MOVE;
+}
+*/
+// Make folder prefix/dav/dav/
+// Go to prefix/sbin, run ./nginx (does not require sudo due to listen being 8000)
+// In another terminal
+// - `dd if=/dev/urandom of=TEST_LARGE_UPLOAD.bin bs=1M count=16` To create a file that will be large enough to require multiple HTTP chunks
+// - `curl -v -T - <./TEST_LARGE_UPLOAD.bin http://localhost:8000/dav/TEST_LARGE_UPLOAD.bin` The `-` and input redirection force curl to use chunked encoding since it cannot know the full size of the input beforehand
+// Watch the nginx terminal for the debug prints showcasing how the unbuffered reading works
+// Rerun the curl command as many times as necessary, it will not throw an error at repeatedly uploading the same file
+
+// Note that currently this code has a lot of printf's in it, these are purely for local debugging and should be either removed or changed into proper nginx logs
+
+// See ngx_http_dav_handler and ngx_http_dav_put_handler for the majority of the changes to this file
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -167,13 +192,33 @@ ngx_http_dav_handler(ngx_http_request_t *r)
             return NGX_HTTP_NOT_IMPLEMENTED;
         }
 
-        r->request_body_in_file_only = 1;
-        r->request_body_in_persistent_file = 1;
-        r->request_body_in_clean_file = 1;
-        r->request_body_file_group_access = 1;
-        r->request_body_file_log_level = 0;
+        // r->request_body_in_file_only = 1;
+        // r->request_body_in_persistent_file = 1;
+        // r->request_body_in_clean_file = 1;
+        // r->request_body_file_group_access = 1;
+        // r->request_body_file_log_level = 0;
+
+        // TODO: Could fall back to the default DAV beahvior if the output file is not a streaming MP4 file, thus making the MP4 block parsing state machine simpler
+        r->request_body_no_buffering = 1;
+
+        // TODO: Since we cannot use the built in temp-file architecture, instead need to persist the same kinds of information in ctx objects attached to the request
+        // ngx_http_set_ctx, ngx_http_get_module_ctx, set and get the ctx object (a pointer to a struct that we define)
+        // This way, we can open the temp file, setup the permissions and group the same way that the temp file architecture does, and then write to the file in the handler, and move to the final location after writing is complete
+
+        // Essentially, define an `ngx_http_dav_ctx_t` struct that contains all the info about the file (using an ngx_file_t if possible, since then it can leverage whatever other nginx file architecture exists) and whatever other metadata is needed for streaming (such as the MP4 block state machine)
+        // In this function, before calling ngx_http_read_client_request_body, alloc a new ngx_http_dav_ctx_t* using ngx_pcalloc and attach using ngx_http_set_ctx
+        // Then inside ngx_http_dav_put_handler call ngx_http_get_module_ctx to get back the ngx_http_dav_ctx_t* and internal server error if it's NULL, then use that info to write to the file and send events to the streaming code
+
+        // Useful things to look into:
+        // ngx_http_write_request_body in ngx_http_request_body.c (fully buffered and thus cannot be used directly, useful to see how normal temp files are created using the above flags)
+        // ngx_open_tempfile in ngx_files.c (os/unix version, does the actual 'open' syscall)
+        // ngx_file_t / ngx_file_s struct in ngx_file.h (contains the full list of things to do with files, including path and access flags)
+
+        printf("PUT DETECTED\n");
 
         rc = ngx_http_read_client_request_body(r, ngx_http_dav_put_handler);
+
+        printf("PUT RESPONSE: %ld\n", rc);
 
         if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
             return rc;
@@ -205,29 +250,95 @@ ngx_http_dav_handler(ngx_http_request_t *r)
 static void
 ngx_http_dav_put_handler(ngx_http_request_t *r)
 {
+    // Commented out to avoid unused variable warning errors
+    static size_t file_count = 0;
     size_t                    root;
-    time_t                    date;
-    ngx_str_t                *temp, path;
+    // time_t                    date;
+    ngx_str_t                /**temp,*/ path;
     ngx_uint_t                status;
-    ngx_file_info_t           fi;
-    ngx_ext_rename_file_t     ext;
-    ngx_http_dav_loc_conf_t  *dlcf;
+    // ngx_file_info_t           fi;
+    // ngx_ext_rename_file_t     ext;
+    // ngx_http_dav_loc_conf_t  *dlcf;
+
+    printf("PUT handler entry\n");
 
     if (r->request_body == NULL) {
+        printf("\tPUT FAIL 0\n");
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "PUT request body is unavailable");
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
 
-    if (r->request_body->temp_file == NULL) {
+    // Note that currently this just consumes the buffers but does not write them to a file
+
+    // Set the read event handler to self so that this function gets a callback when more data is available
+    r->read_event_handler = ngx_http_dav_put_handler;
+
+    // Loop across reads
+    // Because the buffers can be smaller than the file itself, each read doesn't always consume the entirety of the readable data from the backend file descriptor
+    // As such, need to consume what data has currently been read, and then ask the system to try reading again and see if new data is available now, and return if it will only be available later
+    while (1) {
+        // printf("\tPUT reading_body before: %u\n", r->reading_body);
+        // printf("\tPUT bufs before: 0x%lX\n", (uint64_t)r->request_body->bufs);
+
+        ngx_chain_t *bufs = r->request_body->bufs;
+
+        // Useful function to look into:
+        // ngx_write_chain_to_file in ngx_files.c (os/unix version, writes an entire buf-chain to a file, note that you still need to 'consume' the buffers afterwards, see below in the buf chain for loop)
+
+        // Buffers exist in a chain, this for loop is an easy way to walk that chain
+        for (; bufs; bufs = bufs->next) {
+            // bufs->buf->last is a pointer to one past the end of the filled in data, and bufs->buf->pos is the start of the filled in data
+            // Note that these don't have to be the same as the start and end of the backing buffer, these are just the pointers to where the buffer itself has data stored, so everything between those two pointers is valid file data
+            uint64_t count = bufs->buf->last - bufs->buf->pos;
+            file_count += count;
+
+            printf("\t\tPUT buf of size: %lu\n", count);
+
+            // To consume data in a buffer, need to update bufs->buf->pos
+            // To fully consume a buffer, bufs->buf->pos needs to equal bufs->buf->last
+            bufs->buf->pos += count;
+        }
+
+        // r->reading_body gets set to false once the current buffer chain is the known last buffer chain as detected by EOF, so further calls to ngx_http_read_unbuffered_request_body wouldn't work.
+        if (!r->reading_body) {
+            break;
+        }
+
+        // Note that ngx_http_read_unbuffered_request_body does garbage collection on the request body buffer chains, and as such set this to NULL without deallocing (NOTE: Might want to eventually verify with valgrind that this doesn't cause memory leaks, but as far as I can tell from reading the code this is what's supposed to happen and doesn't cause leaks because the entire chain is also stored in r->request_body->busy, which is used for GC purposes)
+        r->request_body->bufs = NULL;
+
+        ngx_int_t rc = ngx_http_read_unbuffered_request_body(r);
+        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            // TODO: Can rc provide more info so that this isn't just a generic internal server error?
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        // printf("\tPUT unbuffered return code: %ld, %d\n", rc, NGX_HTTP_SPECIAL_RESPONSE);
+        // printf("\tPUT reading_body after: %u\n", r->reading_body);
+        // printf("\tPUT bufs after: 0x%lX\n", (uint64_t)r->request_body->bufs);
+
+        // If there's no data for us yet, the r->request_body->bufs will be NULL, and the handler function will be called later when there is more data
+        if (!r->request_body->bufs) {
+            return;
+        }
+    }
+
+    // As soon as the loop is exited, the entire file has finished being read into the buffer chains. As such, need to move the file to its final location and close the file descriptor
+
+    // Original DAV code, commented out
+    /*if (r->request_body->temp_file == NULL) {
+        printf("PUT FAIL 1\n");
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "PUT request body must be in a file");
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
-    }
+    }*/
 
     if (ngx_http_map_uri_to_path(r, &path, &root, 0) == NULL) {
+        printf("PUT FAIL 2\n");
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -237,7 +348,15 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http put filename: \"%s\"", path.data);
 
-    temp = &r->request_body->temp_file->file.name;
+    // `path` contains the full file path to the final output file, example being `.../prefix/dav/dav/TEST_LARGE_UPLOAD.bin`
+    printf("PUT TO FILE PATH: `%s`\n", path.data);
+    printf("OVERALL SIZE: %lu\n", file_count); // Note that file_count is just for testing, and is a static variable. As such this currently cannot handle multiple simultaneous PUTs and should, if actually needed, be moved into the context struct
+    file_count = 0;
+
+    status = NGX_HTTP_CREATED; // Note, this is copied from below and for testing purposes is always set to NGX_HTTP_CREATED. TODO: Should properly handle NGX_HTTP_NO_CONTENT as per below.
+
+    // Original DAV code, commented out
+    /*temp = &r->request_body->temp_file->file.name;
 
     if (ngx_file_info(path.data, &fi) == NGX_FILE_ERROR) {
         status = NGX_HTTP_CREATED;
@@ -291,7 +410,9 @@ ngx_http_dav_put_handler(ngx_http_request_t *r)
         }
 
         r->headers_out.content_length_n = 0;
-    }
+    }*/
+
+    r->headers_out.content_length_n = 0; // Necessary for status = NGX_HTTP_CREATED or curl will hang expecting a response from NGINX, as it sends a chunked response header without sending any chunked data. See above for where this is set in the normal DAV module.
 
     r->headers_out.status = status;
     r->header_only = 1;
